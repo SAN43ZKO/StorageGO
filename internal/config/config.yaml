@@ -1,0 +1,6 @@
+postgres:
+  host: linfed.ru
+  port: 28010
+server:
+  host: localhost
+  port: 8000
