@@ -1,59 +1,72 @@
 package main
 
 import (
-	"Storage/internal/config"
-	"Storage/internal/database"
-	"Storage/internal/router"
 	"context"
+	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
-	"github.com/jackc/pgx/v5"
+	"Storage/internal/config"
+	"Storage/internal/handler"
+	"Storage/internal/storage"
+	"Storage/pkg/postgres"
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("app", "error", err)
+		os.Exit(1)
+	}
+}
 
-	logs := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+func run() error {
+	ctx := context.Background()
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	cfg, err := config.NewConfig()
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("run (1): %w", err)
 	}
-	connStr := makeConnectionStr(cfg)
-	conn, err := pgx.Connect(context.Background(), connStr)
+
+	db, err := postgres.NewPostgres(ctx, cfg)
 	if err != nil {
-		log.Fatal("Connection Error: ", err)
+		return fmt.Errorf("run (2): %w", err)
 	}
-	fmt.Println("Connection successfuly")
-	defer conn.Close(context.Background())
+	defer db.Close(ctx)
 
-	if err := database.InitializeDB(conn); err != nil {
-		log.Fatal("failed to initialize database error", err)
-
+	storage, err := storage.NewStorage(ctx, logger, db)
+	if err != nil {
+		return fmt.Errorf("run (3): %w", err)
 	}
 
-	db := database.NewPostgresStorage(conn)
-	producthandler := router.NewProducHandler(*db)
-	registerRouter(producthandler)
+	productHandler := handler.NewProducHandler(logger, storage)
 
-	logs.Info("Starting server", "addres", cfg.Server.Host+":"+strconv.Itoa(cfg.Server.Port))
-	if err := http.ListenAndServe(cfg.Server.Host+":"+strconv.Itoa(cfg.Server.Port), nil); err != nil {
-		logs.Error("Failed to start server", "err", err)
+	router := http.NewServeMux()
+
+	router.HandleFunc("GET /product/", productHandler.GetProducts)
+	router.HandleFunc("GET /product/{id}", productHandler.GetProductsById)
+	router.HandleFunc("DELETE /product/{id}", productHandler.DeleteProducts)
+	router.HandleFunc("POST /product", productHandler.CreateProducts)
+	router.HandleFunc("PUT /product/{id}", productHandler.UpdateProducts)
+
+	srv := &http.Server{
+		Addr:         cfg.Server.Host + ":" + strconv.Itoa(cfg.Server.Port),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  10 * time.Second,
+		Handler:      router,
 	}
-}
 
-func makeConnectionStr(cfg *config.Config) string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s", cfg.Postgres.User, cfg.Postgres.Password, cfg.Postgres.Host, strconv.Itoa(cfg.Postgres.Port), cfg.Postgres.DB)
-}
+	logger.Info("starting http server", "addr", srv.Addr)
 
-func registerRouter(h *router.ProductHandler) {
-	http.HandleFunc("GET /product/", h.GetProducts)
-	http.HandleFunc("GET /product/{id}", h.GetProductsById)
-	http.HandleFunc("DELETE /product/{id}", h.DeleteProducts)
-	http.HandleFunc("POST /product", h.CreateProducts)
-	http.HandleFunc("PUT /product/{id}", h.UpdateProducts)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("run (4): %w", err)
+	}
+
+	return nil
 }
