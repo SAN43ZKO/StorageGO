@@ -44,6 +44,12 @@ func run() error {
 		return fmt.Errorf("run (3): %w", err)
 	}
 
+	if err := storage.GetAllProduct(ctx, db); err != nil {
+		return fmt.Errorf("run (4): %w", err)
+	}
+
+	go storage.CacheUpdater(ctx)
+
 	productHandler := handler.NewProducHandler(logger, storage)
 
 	router := http.NewServeMux()
@@ -65,7 +71,7 @@ func run() error {
 	logger.Info("starting http server", "addr", srv.Addr)
 
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("run (4): %w", err)
+		return fmt.Errorf("run (5): %w", err)
 	}
 
 	return nil

@@ -1,11 +1,15 @@
 package storage
 
 import (
-	"Storage/internal/model"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"time"
+
+	"Storage/internal/cache"
+	"Storage/internal/model"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -15,16 +19,18 @@ var ErrProductNotFound = errors.New("product not found")
 type Storage struct {
 	logger *slog.Logger
 	db     *pgx.Conn
+	cache  *cache.Cache
 }
 
 func NewStorage(ctx context.Context, logger *slog.Logger, db *pgx.Conn) (*Storage, error) {
 	if err := initDB(ctx, db); err != nil {
-		return nil, fmt.Errorf("NewStorage: %w", err)
+		return nil, fmt.Errorf("NewStorage (1): %w", err)
 	}
 
 	return &Storage{
 		logger: logger,
 		db:     db,
+		cache:  cache.NewCache(),
 	}, nil
 }
 
@@ -47,7 +53,46 @@ func initDB(ctx context.Context, conn *pgx.Conn) error {
 	return nil
 }
 
-const getQuery = `SELECT
+const getAllQuery = `
+	SELECT
+	id,
+	name,
+	coalesce(nullif(description, ''), 'Описание отсутсвует') as description,
+	rubles,
+	pennies,
+	quantity,
+	created_at,
+	updated_at
+	FROM product`
+
+func (s *Storage) GetAllProduct(ctx context.Context, conn *pgx.Conn) error {
+	rows, err := conn.Query(ctx, getAllQuery)
+	if err != nil {
+		return fmt.Errorf("GetAllProduct (1): %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var p model.Product
+
+		if err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.Rubles, &p.Pennies, &p.Quantity, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return fmt.Errorf("GetAllProduct (2): %w", err)
+		}
+
+		s.cache.Set(strconv.Itoa(p.ID), &p)
+	}
+
+	s.logger.Info("All data upload in cache")
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("GetAllProduct (3): %w", err)
+	}
+
+	return nil
+}
+
+const getQuery = `
+	SELECT
 	id,
 	name,
 	coalesce(nullif(description, ''), 'Описание отсутсвует') as description,
@@ -84,7 +129,8 @@ func (s *Storage) GetProduct(ctx context.Context, limit, offset int) ([]model.Pr
 	return product, nil
 }
 
-const getByIdQuery = `SELECT
+const getByIdQuery = `
+	SELECT
 	id,
 	name,
 	coalesce(nullif(description, ''), 'Описание отсутсвует') as description,
@@ -96,6 +142,11 @@ const getByIdQuery = `SELECT
 	FROM product WHERE id = $1`
 
 func (s *Storage) GetProductById(ctx context.Context, id int) (*model.Product, error) {
+	if cacheData, found := s.cache.Get(strconv.Itoa(id)); found {
+		s.logger.Info("Data from cache")
+		return cacheData.(*model.Product), nil
+	}
+
 	var p model.Product
 	err := s.db.QueryRow(ctx, getByIdQuery, id).Scan(&p.ID, &p.Name, &p.Description, &p.Rubles, &p.Pennies, &p.Quantity, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
@@ -121,17 +172,22 @@ func (s *Storage) DeleteProduct(ctx context.Context, id int) error {
 		return fmt.Errorf("DeleteProduct (3): %w", err)
 	}
 
+	s.cache.Delete(strconv.Itoa(id))
+	s.GetAllProduct(ctx, s.db)
+
 	return nil
 }
 
-const createQuery = `INSERT INTO product(
-	name,
-	description,
-	rubles,
-	pennies,
-	quantity,
-	created_at,
-	updated_at) VALUES($1, $2, $3, $4, $5, $6, $7)`
+const createQuery = `
+	INSERT INTO product(
+		name,
+		description,
+		rubles,
+		pennies,
+		quantity,
+		created_at,
+		updated_at)
+	VALUES($1, $2, $3, $4, $5, $6, $7)`
 
 func (s *Storage) CreateProduct(ctx context.Context, product *model.Product) error {
 	_, err := s.db.Exec(ctx, createQuery,
@@ -147,10 +203,13 @@ func (s *Storage) CreateProduct(ctx context.Context, product *model.Product) err
 		return fmt.Errorf("CreateProduct: %w", err)
 	}
 
+	s.GetAllProduct(ctx, s.db)
+
 	return nil
 }
 
-const updateQuery = `UPDATE product SET
+const updateQuery = `
+	UPDATE product SET
 	name = $1,
 	description = $2,
 	rubles = $3,
@@ -180,13 +239,17 @@ func (s *Storage) UpdateProduct(ctx context.Context, product *model.Product) err
 	if err != nil {
 		return fmt.Errorf("UpdateProduct (3): %w", err)
 	}
+
+	s.GetAllProduct(ctx, s.db)
+
 	return nil
 }
 
-const checkQuery = `SELECT EXISTS(
-	SELECT 1
-	FROM product
-	WHERE id = $1)`
+const checkQuery = `
+	SELECT EXISTS(
+		SELECT 1
+		FROM product
+		WHERE id = $1)`
 
 func (s *Storage) CheckIdOnExist(ctx context.Context, id int) (bool, error) {
 	var isExist bool
@@ -195,4 +258,19 @@ func (s *Storage) CheckIdOnExist(ctx context.Context, id int) (bool, error) {
 	}
 
 	return isExist, nil
+}
+
+func (s *Storage) CacheUpdater(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.logger.Info("Updating cache...")
+			if err := s.GetAllProduct(ctx, s.db); err != nil {
+				s.logger.Error("CacheUpdater: %w", err)
+			}
+		}
+	}
 }
